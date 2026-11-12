@@ -1,32 +1,30 @@
+
 import express from "express";
 import cors from "cors";
-import OpenAI from "openai";
 import rateLimit from "express-rate-limit";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
+const GEMINI_MODEL = "gemini-2.5-flash";
 
 app.use(cors());
 app.use(express.json({ limit: "32kb" }));
 
-// Limite básico contra excesso de chamadas durante os testes.
 app.use("/api/", rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 20,
   standardHeaders: "draft-7",
   legacyHeaders: false,
-  message: { error: "Muitas solicitações. Aguarde alguns minutos e tente novamente." }
+  message: {
+    error: "Muitas solicitações. Aguarde alguns minutos e tente novamente."
+  }
 }));
-
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
 
 app.get("/", (_req, res) => {
   res.json({
     app: "Mobile IA API",
     status: "online",
-    message: "Servidor funcionando."
+    message: "Servidor funcionando com Gemini."
   });
 });
 
@@ -36,9 +34,11 @@ app.get("/health", (_req, res) => {
 
 app.post("/api/chat", async (req, res) => {
   try {
-    if (!process.env.OPENAI_API_KEY) {
+    const apiKey = process.env.GEMINI_API_KEY;
+
+    if (!apiKey) {
       return res.status(500).json({
-        error: "A chave OPENAI_API_KEY não foi configurada no servidor."
+        error: "A variável GEMINI_API_KEY não foi configurada no Render."
       });
     }
 
@@ -46,7 +46,7 @@ app.post("/api/chat", async (req, res) => {
 
     if (!Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({
-        error: "Envie uma lista de mensagens no campo messages."
+        error: "Envie uma lista de mensagens válida."
       });
     }
 
@@ -56,7 +56,8 @@ app.post("/api/chat", async (req, res) => {
       });
     }
 
-    const validMessages = [];
+    const contents = [];
+
     for (const message of messages) {
       if (
         !message ||
@@ -66,48 +67,94 @@ app.post("/api/chat", async (req, res) => {
         message.content.length > 8000
       ) {
         return res.status(400).json({
-          error: "Cada mensagem precisa ter role user/assistant e texto válido de até 8.000 caracteres."
+          error: "Mensagem inválida. Confira o conteúdo enviado."
         });
       }
 
-      validMessages.push({
-        role: message.role,
-        content: message.content.trim()
+      contents.push({
+        role: message.role === "assistant" ? "model" : "user",
+        parts: [{ text: message.content.trim() }]
       });
     }
 
-    const response = await openai.responses.create({
-      model: process.env.OPENAI_MODEL || "gpt-5.5",
-      instructions:
-        "Você é a Mobile IA, uma assistente útil, clara, responsável e amigável. Responda em português do Brasil, a menos que o usuário peça outro idioma.",
-      input: validMessages
-    });
+    const response = await fetch(
+      "https://generativelanguage.googleapis.com/v1beta/models/" +
+      GEMINI_MODEL + ":generateContent",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": apiKey
+        },
+        body: JSON.stringify({
+          system_instruction: {
+            parts: [{
+              text:
+                "Você é a Mobile IA, uma assistente útil, inteligente, " +
+                "clara, responsável e amigável. Responda em português " +
+                "do Brasil, a menos que o usuário peça outro idioma."
+            }]
+          },
+          contents: contents,
+          generationConfig: {
+            temperature: 0.8,
+            maxOutputTokens: 2048
+          }
+        })
+      }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      console.error("Erro da Gemini:", data.error?.message || response.status);
+
+      if (response.status === 401 || response.status === 403) {
+        return res.status(502).json({
+          error: "A Gemini recusou a chave. Confira GEMINI_API_KEY no Render."
+        });
+      }
+
+      if (response.status === 429) {
+        return res.status(429).json({
+          error: "Limite gratuito da Gemini atingido. Aguarde e tente novamente."
+        });
+      }
+
+      return res.status(502).json({
+        error: "A Gemini não conseguiu processar a solicitação. Código: " +
+          response.status
+      });
+    }
+
+    const parts = data.candidates?.[0]?.content?.parts || [];
+
+    const reply = parts
+      .filter(part => typeof part.text === "string")
+      .map(part => part.text)
+      .join("\n")
+      .trim();
+
+    if (!reply) {
+      return res.status(502).json({
+        error: "A Gemini não retornou uma resposta em texto."
+      });
+    }
 
     return res.json({
-      reply: response.output_text || "Não consegui gerar uma resposta em texto.",
-      responseId: response.id
+      reply: reply,
+      model: GEMINI_MODEL
     });
+
   } catch (error) {
     console.error("Erro em /api/chat:", error?.message || error);
 
-    if (error?.status === 401) {
-      return res.status(502).json({
-        error: "A OpenAI recusou a chave. Confira a variável OPENAI_API_KEY no Render."
-      });
-    }
-
-    if (error?.status === 429) {
-      return res.status(429).json({
-        error: "Limite ou saldo da API atingido. Confira o uso e o faturamento da sua conta OpenAI."
-      });
-    }
-
     return res.status(500).json({
-      error: "O servidor não conseguiu concluir a solicitação. Tente novamente."
+      error: "Erro interno no servidor. Tente novamente."
     });
   }
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Mobile IA API rodando na porta ${PORT}`);
+  console.log("Mobile IA API com Gemini rodando na porta " + PORT);
 });
